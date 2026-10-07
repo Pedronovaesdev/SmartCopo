@@ -5,8 +5,8 @@
   quando a bebida esquenta ou esta acabando.
 
   Componentes (simulados no Wokwi):
-    - Sensor NTC 10k (temperatura)        -> GPIO 34
-    - HC-SR04 ultrassonico (nivel)        -> TRIG 5 / ECHO 18
+    - Sensor DS18B20 1-Wire (temperatura)  -> DQ 15 (pull-up 4.7k p/ 3V3)
+    - Celula de carga + HX711 (peso/nivel) -> DT 5 / SCK 18
     - Display OLED SSD1306 (I2C)          -> SDA 21 / SCL 22
     - LED verde / amarelo / vermelho      -> GPIO 26 / 27 / 32
     - Buzzer                              -> GPIO 25
@@ -22,7 +22,20 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <HX711.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include <math.h>
+
+// Descomente a linha abaixo para imprimir o valor BRUTO do HX711 no Serial
+// Monitor e descobrir o CALIBRACAO_HX711 correto (veja README.md).
+// #define CALIBRAR_HX711
+
+// Com esta linha ativa, o peso NAO vem da celula de carga real - o firmware
+// gera sozinho um ciclo de "copo cheio sendo bebido aos poucos" para
+// demonstracao/teste no simulador, sem precisar mexer em nenhum slider.
+// Comente esta linha para voltar a ler o HX711 de verdade.
+#define SIMULAR_CONSUMO
 
 // ======== Configuracoes da mesa e limites ========
 const char* MESA            = "05";
@@ -30,14 +43,15 @@ const float TEMP_LIMITE     = 10.0;  // C: acima disso a bebida nao esta mais ge
 const float TEMP_HISTERESE  = 1.0;   // evita o alerta ficar ligando/desligando no limite
 const int   NIVEL_BAIXO     = 25;    // %: abaixo disso a bebida esta acabando
 const int   NIVEL_HISTERESE = 5;
-const float DIST_CHEIO      = 3.0;   // cm entre o sensor e o liquido com o copo cheio
-const float DIST_VAZIO      = 15.0;  // cm entre o sensor e o fundo do copo
-const float DIST_SEM_COPO   = 25.0;  // acima disso considera que nao ha copo
+const float CALIBRACAO_HX711 = -420.0; // fator de calibracao da celula de carga (g por unidade bruta)
+const float PESO_COPO_VAZIO = 20.0;   // g: peso estimado do copo vazio (usado so como piso do calculo)
+const float PESO_COPO_CHEIO_PADRAO = 220.0; // g: usado so se o copo for colocado com a balanca ainda calibrando
+const float PESO_SEM_COPO   = 10.0;   // g: abaixo disso considera que nao ha copo na balanca
 
 // ======== Pinos ========
-const int PIN_NTC      = 34;
-const int PIN_TRIG     = 5;
-const int PIN_ECHO     = 18;
+const int PIN_DS18B20   = 15;
+const int PIN_HX_DT     = 5;
+const int PIN_HX_SCK    = 18;
 const int LED_VERDE    = 26;
 const int LED_AMARELO  = 27;
 const int LED_VERMELHO = 32;
@@ -52,11 +66,15 @@ const char* MQTT_BROKER = "broker.hivemq.com";
 const char* TOPICO_BASE = "smartcopo/demo/mesa05";
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
+HX711 balanca;
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature sensorTemp(&oneWire);
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 
 // ======== Estado ========
-float temperatura = 0, distancia = 0;
+float temperatura = 0, peso = 0;
+float pesoCheioAtual = PESO_COPO_CHEIO_PADRAO;  // peso capturado quando o copo foi colocado (cheio)
 int   nivel = 0;
 bool  alertaTemp = false, alertaNivel = false, semCopo = false;
 bool  atendido = false, wifiAvisado = false;
@@ -65,23 +83,67 @@ unsigned long contadorLeituras = 0;
 
 // ---------- Sensores ----------
 float lerTemperatura() {
-  int adc = constrain(analogRead(PIN_NTC), 1, 4094);
-  const float BETA = 3950;
-  return 1 / (log(1 / (4095.0 / adc - 1)) / BETA + 1.0 / 298.15) - 273.15;
+  sensorTemp.requestTemperatures();
+  float t = sensorTemp.getTempCByIndex(0);
+  return t == DEVICE_DISCONNECTED_C ? temperatura : t;  // mantem ultima leitura se o sensor nao respondeu
 }
 
-float lerDistancia() {
-  digitalWrite(PIN_TRIG, LOW);  delayMicroseconds(2);
-  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
-  digitalWrite(PIN_TRIG, LOW);
-  long duracao = pulseIn(PIN_ECHO, HIGH, 30000);
-  if (duracao == 0) return 999;          // sem eco = nada na frente do sensor
-  return duracao * 0.0343 / 2.0;         // cm
+#ifdef SIMULAR_CONSUMO
+// Gera um ciclo repetido: sem copo -> copo cheio colocado -> esvaziando aos
+// poucos (como se alguem estivesse bebendo) -> copo vazio parado -> repete.
+float lerPesoSimulado() {
+  const unsigned long SEM_COPO_MS = 4000;    // 4s sem copo na mesa
+  const unsigned long BEBENDO_MS  = 40000;   // 40s pra "beber" o copo todo
+  const unsigned long VAZIO_MS    = 6000;    // 6s com o copo vazio na mesa
+  const float PESO_CHEIO_SIM = 230.0;        // g: copo + bebida ao ser colocado
+
+  unsigned long duracaoCiclo = SEM_COPO_MS + BEBENDO_MS + VAZIO_MS;
+  unsigned long t = millis() % duracaoCiclo;
+
+  if (t < SEM_COPO_MS) return 0.0;
+
+  t -= SEM_COPO_MS;
+  if (t < BEBENDO_MS) {
+    float progresso = (float)t / BEBENDO_MS;  // 0.0 (cheio) -> 1.0 (vazio)
+    return PESO_CHEIO_SIM - progresso * (PESO_CHEIO_SIM - PESO_COPO_VAZIO);
+  }
+
+  return PESO_COPO_VAZIO;  // copo vazio ainda na mesa, aguardando reposicao
+}
+#endif
+
+float lerPeso() {
+#ifdef SIMULAR_CONSUMO
+  return lerPesoSimulado();
+#endif
+  if (!balanca.is_ready()) return peso;  // mantem ultima leitura se a balanca nao respondeu
+#ifdef CALIBRAR_HX711
+  long bruto = balanca.get_value(5);
+  Serial.printf("[CALIBRACAO] valor bruto = %ld  (aplique um peso conhecido e calcule bruto / peso_em_g)\n", bruto);
+#endif
+  float g = balanca.get_units(5);
+  return g < 0 ? 0 : g;
 }
 
-int calcularNivel(float d) {
-  float n = (DIST_VAZIO - d) / (DIST_VAZIO - DIST_CHEIO) * 100.0;
+int calcularNivel(float g, float cheio) {
+  float n = (g - PESO_COPO_VAZIO) / (cheio - PESO_COPO_VAZIO) * 100.0;
   return constrain((int)round(n), 0, 100);
+}
+
+// Detecta quando um copo novo foi colocado na balanca e registra o peso dele
+// (presumido cheio) como referencia de 100%. A contagem de volume passa a
+// ser feita pela variacao de peso a partir desse momento, nao por um valor
+// fixo - assim funciona com copos/bebidas de pesos diferentes.
+void atualizarCopo() {
+  bool semCopoAntes = semCopo;
+  semCopo = peso < PESO_SEM_COPO;
+
+  if (!semCopo && semCopoAntes) {
+    pesoCheioAtual = max(peso, PESO_COPO_VAZIO + 20.0f);  // evita divisao por valor quase zero
+    Serial.printf("Copo novo detectado: %.1f g registrado como 100%%\n", pesoCheioAtual);
+  } else if (semCopo && !semCopoAntes) {
+    pesoCheioAtual = PESO_COPO_CHEIO_PADRAO;  // volta ao padrao ate o proximo copo ser colocado
+  }
 }
 
 // ---------- Comunicacao ----------
@@ -136,7 +198,6 @@ void chamarGarcom(const char* motivo) {
 void atualizarEstados() {
   bool antTemp = alertaTemp, antNivel = alertaNivel;
 
-  semCopo = distancia > DIST_SEM_COPO;
   if (semCopo) { alertaTemp = false; alertaNivel = false; return; }
 
   if (!alertaTemp && temperatura > TEMP_LIMITE) alertaTemp = true;
@@ -230,13 +291,18 @@ void desenharTela() {
 // ---------- Setup / Loop ----------
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_TRIG, OUTPUT);
-  pinMode(PIN_ECHO, INPUT);
   pinMode(LED_VERDE, OUTPUT);
   pinMode(LED_AMARELO, OUTPUT);
   pinMode(LED_VERMELHO, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_BOTAO, INPUT_PULLUP);
+
+  balanca.begin(PIN_HX_DT, PIN_HX_SCK);
+  balanca.set_scale(CALIBRACAO_HX711);
+  balanca.tare();  // zera a balanca (deve iniciar vazia, sem copo em cima)
+
+  sensorTemp.begin();
+  sensorTemp.setResolution(9);  // conversao mais rapida (~94 ms em vez de 750 ms)
 
   Wire.begin(21, 22);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) Serial.println("OLED nao encontrado");
@@ -252,6 +318,7 @@ void setup() {
     mqtt.setServer(MQTT_BROKER, 1883);
   }
   Serial.println("SmartCopo pronto. Limites: temp > 10 C ou nivel < 25% chamam o garcom.");
+  Serial.println("Balanca (HX711) tarada - calibre CALIBRACAO_HX711 se o peso nao bater.");
 }
 
 void loop() {
@@ -262,12 +329,13 @@ void loop() {
   if (millis() - ultimaLeitura >= 1000) {
     ultimaLeitura = millis();
     temperatura = lerTemperatura();
-    distancia   = lerDistancia();
-    nivel       = calcularNivel(distancia);
+    peso        = lerPeso();
+    atualizarCopo();
+    nivel       = calcularNivel(peso, pesoCheioAtual);
     atualizarEstados();
     desenharTela();
-    Serial.printf("Mesa %s | %.1f C | nivel %d%% (%.1f cm) | %s\n",
-                  MESA, temperatura, nivel, distancia, statusTexto().c_str());
+    Serial.printf("Mesa %s | %.1f C | nivel %d%% (%.1f g de %.1f g) | %s\n",
+                  MESA, temperatura, nivel, peso, pesoCheioAtual, statusTexto().c_str());
     if (++contadorLeituras % 5 == 0) publicar("status", jsonStatus("leitura"));
   }
 

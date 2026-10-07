@@ -6,3 +6,6 @@ Adafruit GFX Library
 
 Adafruit SSD1306
 PubSubClient
+HX711 Arduino Library
+OneWire
+DallasTemperature

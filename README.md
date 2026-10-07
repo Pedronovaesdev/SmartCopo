@@ -8,23 +8,58 @@ Projeto original: https://wokwi.com/projects/475888782649981953
 
 ## Como funciona
 
-- A cada 1 segundo o firmware lê a temperatura (sensor NTC) e a distância até o líquido (sensor ultrassônico HC-SR04), converte a distância em nível percentual do copo e atualiza o display OLED.
+- A cada 1 segundo o firmware lê a temperatura (sensor digital **DS18B20**, 1-Wire) e o peso do copo na **célula de carga + HX711**, converte o peso em nível percentual do copo e atualiza o display OLED.
 - Se a temperatura passar de **10 °C** ou o nível cair abaixo de **25%**, o dispositivo entra em alerta: LED correspondente pisca, o buzzer bipa a cada 2s, e uma mensagem é publicada via MQTT.
 - Histerese (1 °C / 5%) evita que o alerta fique ligando e desligando no limite.
 - O botão "Atendido" silencia o alerta (LED fica aceso fixo) até a bebida ser reposta e os valores normalizarem.
-- Se o sensor de distância não enxergar nada por perto (> 25 cm), o sistema assume que não há copo na mesa.
+- Se o peso na balança ficar abaixo de 10g, o sistema assume que não há copo na mesa.
 - Status e eventos são publicados no broker público MQTT `broker.hivemq.com`, tópico base `smartcopo/demo/mesa05`.
 
 ### Pinagem (ESP32)
 
-| Componente                          | Pino(s)         |
-|--------------------------------------|-----------------|
-| Sensor NTC 10k (temperatura)         | GPIO 34         |
-| HC-SR04 (nível) — TRIG / ECHO        | GPIO 5 / GPIO 18|
-| Display OLED SSD1306 (I2C) — SDA/SCL | GPIO 21 / GPIO 22|
-| LED verde / amarelo / vermelho       | GPIO 26 / 27 / 32|
-| Buzzer                               | GPIO 25         |
-| Botão "Atendido"                     | GPIO 4          |
+| Componente                            | Pino(s)           |
+|----------------------------------------|-------------------|
+| DS18B20 (temperatura, 1-Wire)           | GPIO 15 (+ pull-up 4.7kΩ p/ 3V3) |
+| Célula de carga + HX711 (peso/nível) — DT / SCK | GPIO 5 / GPIO 18  |
+| Display OLED SSD1306 (I2C) — SDA/SCL    | GPIO 21 / GPIO 22 |
+| LED verde / amarelo / vermelho         | GPIO 26 / 27 / 32 |
+| Buzzer                                 | GPIO 25           |
+| Botão "Atendido"                       | GPIO 4            |
+
+> A célula de carga precisa ser calibrada: ajuste `CALIBRACAO_HX711` e `PESO_COPO_VAZIO` no [SmartCopo.ino](SmartCopo.ino) para a sua balança real. No simulador, o peso aplicado ao HX711 é ajustado pelo slider que aparece ao clicar no componente durante a simulação.
+>
+> O nível não usa um peso "cheio" fixo: quando um copo é colocado na mesa (peso sobe acima de `PESO_SEM_COPO`), o firmware registra esse peso como referência de 100% e calcula o volume consumido a partir da **variação de peso** desse momento em diante — assim funciona com copos e bebidas de pesos diferentes, não só com um valor fixo de calibração.
+
+### Modo de demonstração (peso simulado automaticamente)
+
+Por padrão, o firmware está com `#define SIMULAR_CONSUMO` **ativo** no topo do [SmartCopo.ino](SmartCopo.ino). Com isso, o peso não vem da célula de carga real — o código mesmo gera um ciclo repetido, sem precisar mexer em nenhum slider:
+
+1. **4s** sem copo na mesa (`SEM_COPO`)
+2. Um copo "cheio" (230g) aparece e vai sendo "bebido" aos poucos ao longo de **40s**, até sobrar só o peso do copo vazio
+3. **6s** com o copo vazio parado na mesa
+4. Repete o ciclo
+
+É a forma mais simples de ver o nível caindo, o alerta de "bebida acabando" disparando, o botão "Atendido" silenciando o buzzer, etc., direto no simulador.
+
+Para voltar a usar a célula de carga/HX711 de verdade (e o slider manual de peso), comente essa linha:
+```cpp
+// #define SIMULAR_CONSUMO
+```
+e recompile.
+
+### Calibrando a célula de carga (HX711)
+
+> Só é necessário se `SIMULAR_CONSUMO` estiver **desativado** (ou ao montar o circuito físico de verdade).
+
+O fator `CALIBRACAO_HX711` converte o valor bruto do sensor em gramas, e esse fator **não é universal** — depende da célula de carga (real) ou do chip simulado (Wokwi), então sempre precisa ser medido:
+
+1. No [SmartCopo.ino](SmartCopo.ino), descomente a linha `// #define CALIBRAR_HX711` perto do topo do arquivo.
+2. Recompile (`arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir build .`) e rode o simulador.
+3. Com a balança sem peso nenhum (slider do HX711 em 0), deixe o firmware iniciar e tarar.
+4. Aplique um peso conhecido no slider "Pressure" do componente (ex.: exatamente **1.000 kg** = 1000 g).
+5. No Serial Monitor vai aparecer algo como `[CALIBRACAO] valor bruto = -420000`.
+6. Calcule: `CALIBRACAO_HX711 = valor_bruto / peso_em_gramas` (no exemplo: `-420000 / 1000 = -420`).
+7. Coloque esse número na constante `CALIBRACAO_HX711`, comente a linha `#define CALIBRAR_HX711` de novo, e recompile.
 
 ## Estrutura do projeto
 
@@ -54,7 +89,7 @@ arduino-cli config set board_manager.additional_urls https://raw.githubuserconte
 arduino-cli core update-index
 arduino-cli core install esp32:esp32
 
-arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" "PubSubClient"
+arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" "PubSubClient" "HX711 Arduino Library" "OneWire" "DallasTemperature"
 ```
 
 ### 3. Compilar o firmware
